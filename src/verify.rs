@@ -62,9 +62,86 @@ pub fn tag_fingerprint(tag: &ScannedTag<'_>) -> TagFingerprint {
         attributes: tag
             .attributes
             .iter()
-            .map(|attr| (attr.name_key.clone(), attr.raw.to_string()))
+            .enumerate()
+            .map(|(idx, attr)| (attr.name_key.clone(), masked_attr_value(tag, idx, attr.raw)))
+            .collect(),
+        // Recurse into nested attribute-value elements so the structure check
+        // sees the full two-level (and arbitrarily deep) markup (Finding 5,
+        // Requirements 7.5, 7.6). Children are kept in source order; the plugin
+        // never reorders them.
+        children: tag
+            .children
+            .iter()
+            .map(|child| tag_fingerprint(&child.tag))
             .collect(),
     }
+}
+
+/// Placeholder that replaces each nested-element byte region inside an owning
+/// attribute's raw value when building its fingerprint. Using a single NUL char
+/// (which never appears in valid source markup) per child collapses the child's
+/// bytes to a stable token so the attribute-value comparison ignores the
+/// whitespace a two-level child rewrite introduced, while the child's own
+/// structure is compared separately through [`TagFingerprint::children`].
+const CHILD_PLACEHOLDER: &str = "\u{0}";
+
+/// Build the fingerprint value for attribute `attr_index` of `tag`, with every
+/// nested child's byte region inside that attribute's raw value replaced by
+/// [`CHILD_PLACEHOLDER`].
+///
+/// An attribute whose value contains a genuine nested element (`primary={ <a …>
+/// … </a> }`) has that element rewritten independently by the engine, so the
+/// attribute's raw bytes change (new continuation whitespace inside the child).
+/// Those changes are NOT a structural divergence — the child's structure is
+/// captured recursively in [`TagFingerprint::children`] — so the attribute-value
+/// comparison must disregard them. Masking each child region to a single stable
+/// token leaves exactly the NON-child skeleton of the value (which the formatter
+/// must preserve byte-for-byte) available for comparison, honoring the
+/// Requirement 7.5 "disregard only formatter whitespace" relation at both levels.
+///
+/// Attributes with no children (the common case) return their raw verbatim, so
+/// every existing fingerprint is unchanged.
+///
+/// Char-boundary note: `offset_in_attr_raw` and each child span length are
+/// scanner-produced char-boundary offsets within the attribute's raw slice, so
+/// every slice taken here is boundary-safe; out-of-range or non-boundary offsets
+/// are skipped defensively, never panicking (Requirement 7.9).
+fn masked_attr_value(tag: &ScannedTag<'_>, attr_index: usize, raw: &str) -> String {
+    // Collect the (start, end) child regions owned by this attribute, in raw
+    // coordinates, sorted by start.
+    let mut regions: Vec<(usize, usize)> = tag
+        .children
+        .iter()
+        .filter(|c| c.owner_attr_index == attr_index)
+        .map(|c| {
+            let start = c.offset_in_attr_raw;
+            let end = start + (c.tag.span.end - c.tag.span.start);
+            (start, end)
+        })
+        .collect();
+    if regions.is_empty() {
+        return raw.to_string();
+    }
+    regions.sort_by_key(|(s, _)| *s);
+
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    for (start, end) in regions {
+        // Defensive bounds / ordering / boundary checks (never panic).
+        if start < cursor
+            || end > raw.len()
+            || start > end
+            || !raw.is_char_boundary(start)
+            || !raw.is_char_boundary(end)
+        {
+            continue;
+        }
+        out.push_str(&raw[cursor..start]);
+        out.push_str(CHILD_PLACEHOLDER);
+        cursor = end;
+    }
+    out.push_str(&raw[cursor..]);
+    out
 }
 
 /// Whether a tag's `before` and `after` fingerprints are equivalent under the
@@ -91,7 +168,22 @@ pub fn tag_fingerprints_equivalent(
     if before.name != after.name || before.self_closing != after.self_closing {
         return false;
     }
-    attributes_equivalent(&before.attributes, &after.attributes, sorting)
+    if !attributes_equivalent(&before.attributes, &after.attributes, sorting) {
+        return false;
+    }
+    // Nested attribute-value elements must match one-for-one in source order,
+    // each recursively equivalent under the same relation (Finding 5). A
+    // dropped, added, or structurally changed child is a divergence just like a
+    // top-level tag. Children are never reordered by the plugin, so they are
+    // compared as an ordered sequence regardless of `sorting`.
+    if before.children.len() != after.children.len() {
+        return false;
+    }
+    before
+        .children
+        .iter()
+        .zip(after.children.iter())
+        .all(|(b, a)| tag_fingerprints_equivalent(b, a, sorting))
 }
 
 /// Compare two attribute `(name_key, raw)` lists under the Requirement 7.5
@@ -320,6 +412,7 @@ mod tests {
                 .iter()
                 .map(|(n, r)| (n.map(str::to_string), (*r).to_string()))
                 .collect(),
+            children: Vec::new(),
         }
     }
 

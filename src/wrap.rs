@@ -284,6 +284,7 @@ mod tests {
             confidently_rewritable: true,
             open_col,
             base_indent_col,
+            children: Vec::new(),
         }
     }
 
@@ -616,6 +617,7 @@ mod single_line_property_tests {
                     // column equals the line's indentation.
                     open_col: col,
                     base_indent_col: col,
+                    children: Vec::new(),
                 }
             })
     }
@@ -673,6 +675,7 @@ mod single_line_property_tests {
                 confidently_rewritable: true,
                 open_col,
                 base_indent_col: 0,
+                children: Vec::new(),
             };
             let layout = plan_layout(&tag, line_width, INDENT_WIDTH);
             prop_assert!(layout.single_line, "zero-attribute tag must stay single line");
@@ -769,6 +772,7 @@ mod greedy_maximality_property_tests {
             confidently_rewritable: true,
             open_col: shape.open_col,
             base_indent_col: shape.base_indent_col,
+            children: Vec::new(),
         }
     }
 

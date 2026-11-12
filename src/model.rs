@@ -91,6 +91,89 @@ pub struct ScannedTag<'a> {
     /// not from `open_col`, so mid-expression tags do not push continuation lines
     /// far to the right.
     pub base_indent_col: usize,
+    /// Genuine JSX element start tags discovered inside this tag's attribute
+    /// values, in source order, each paired with the provenance task 4.4's
+    /// recursive `rewrite_tag` needs to map it from source coordinates to its
+    /// position in the enclosing tag's *rendered* output (see [`NestedChild`]).
+    ///
+    /// Each child's [`tag`](NestedChild::tag)'s [`span`](ScannedTag::span) is
+    /// expressed in SOURCE coordinates **relative to this (enclosing) tag's
+    /// `span.start`** (not absolute buffer offsets, and not rendered offsets).
+    ///
+    /// The stored span is **never** used directly as a rendered offset: the
+    /// source→rendered mapping is computed at rewrite time from the
+    /// attribute-offset table (see `rewrite_tag`, task 4.4), keyed by the owning
+    /// attribute's IDENTITY via [`NestedChild::owner_attr_index`] and the child's
+    /// [`offset_in_attr_raw`](NestedChild::offset_in_attr_raw), because the
+    /// enclosing wrap moves the attribute value to a new continuation column, so
+    /// a source-measured position would not be a fixed point.
+    ///
+    /// Each child's [`tag`](NestedChild::tag) carries its own
+    /// [`attributes`](ScannedTag::attributes) and
+    /// [`confidently_rewritable`](ScannedTag::confidently_rewritable) flag. A
+    /// child's [`open_col`](ScannedTag::open_col) and
+    /// [`base_indent_col`](ScannedTag::base_indent_col) are **not** authoritative
+    /// here: they are RECOMPUTED at rewrite time from the child's RENDERED
+    /// position (Finding 4, task 4.4), because the source-measured geometry does
+    /// not survive the enclosing wrap and would not be a fixed point.
+    ///
+    /// This field is empty in the overwhelming common case — any start tag with
+    /// no element-bearing attribute value — and for every non-JSX/TSX dialect
+    /// (HTML, Vue, Astro, Svelte), so non-nested tags and non-JSX dialects are
+    /// byte-for-byte unaffected. A child's own
+    /// [`tag.children`](ScannedTag::children) may itself be non-empty, so nesting
+    /// can recurse to arbitrary depth.
+    pub children: Vec<NestedChild<'a>>,
+}
+
+/// A genuine JSX element start tag discovered inside one of an enclosing
+/// [`ScannedTag`]'s attribute values, paired with the provenance needed to
+/// splice its own rewrite back into the enclosing tag's *rendered* output
+/// without any text search (Finding 3, consumed by task 4.4's recursive
+/// `rewrite_tag`).
+///
+/// # Why identity + intra-`raw` offset, not a rendered span
+///
+/// When the enclosing tag is wrapped, its attribute values move to new
+/// continuation columns, so a child's *source* position is not its *rendered*
+/// position. The scanner therefore records, per child, two **source-coordinate**
+/// facts that survive the enclosing rewrite:
+///
+/// - [`owner_attr_index`](Self::owner_attr_index) — the index of the attribute
+///   whose `raw` value contains this child, in the enclosing tag's
+///   **source-order** [`attributes`](ScannedTag::attributes) vector. This is a
+///   *stable identity* for the owning attribute: even when sorting reorders the
+///   attributes before rendering, task 4.4 keys its attribute-offset table by
+///   this same source index (the `Attribute` object a given source index names
+///   is unchanged by sorting — sorting permutes the vector, it does not clone or
+///   mutate the elements), so the child is located by attribute **identity**,
+///   never by substring search over the rendered text.
+/// - [`offset_in_attr_raw`](Self::offset_in_attr_raw) — the byte offset at which
+///   this child's `<` begins, measured **relative to the start of the owning
+///   attribute's `raw` slice** (so `attr.raw[offset_in_attr_raw..]` begins with
+///   the child's `<`). Because each attribute's `raw` is re-emitted verbatim by
+///   the renderer, this same intra-`raw` offset applies unchanged in the
+///   rendered output: `child_rendered_start = attr_rendered_start +
+///   offset_in_attr_raw` (task 4.4), with `attr_rendered_start` read from the
+///   render stage's identity-keyed offset table.
+///
+/// [`tag`](Self::tag) is the child's own [`ScannedTag`], whose `span` is in
+/// SOURCE coordinates relative to the enclosing tag's `span.start`. That span is
+/// used only to recover geometry context, never as a rendered offset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedChild<'a> {
+    /// Index of the owning attribute in the enclosing tag's **source-order**
+    /// [`attributes`](ScannedTag::attributes) vector. A stable identity for the
+    /// attribute under sorting (see the type-level docs).
+    pub owner_attr_index: usize,
+    /// Byte offset of this child's `<` relative to the start of the owning
+    /// attribute's [`raw`](Attribute::raw) slice. `attr.raw[offset_in_attr_raw..]`
+    /// begins with the child's `<`; the same offset applies in the rendered
+    /// output because `raw` is re-emitted verbatim.
+    pub offset_in_attr_raw: usize,
+    /// The child's own start tag, with a `span` in SOURCE coordinates relative
+    /// to the enclosing tag's `span.start`.
+    pub tag: ScannedTag<'a>,
 }
 
 /// Tag-local structural fingerprint: element name, self-closing flag, and the
@@ -105,6 +188,14 @@ pub struct TagFingerprint {
     /// Ordered attribute identity pairs: `(name_key, raw-value)`. `name_key` is
     /// `None` for pure spreads; `raw` is carried so value identity is captured.
     pub attributes: Vec<(Option<String>, String)>,
+    /// Structural fingerprints of the genuine JSX elements nested inside this
+    /// tag's attribute values, in source order (task 4.4, Finding 5). Empty in
+    /// the common case and for every non-JSX/TSX dialect. Recursing the
+    /// fingerprint over `children` lets the structure-equivalence check see the
+    /// full two-level (and arbitrarily deep) markup structure, so a nested
+    /// element that is dropped, duplicated, or structurally changed by a
+    /// two-level rewrite is caught just like a top-level tag.
+    pub children: Vec<TagFingerprint>,
 }
 
 /// A single element in a whole-document [`Fingerprint`]: either a start tag's
@@ -263,6 +354,7 @@ mod tests {
             confidently_rewritable: true,
             open_col: 0,
             base_indent_col: 0,
+            children: Vec::new(),
         };
         assert_eq!(tag.attributes.len(), 1);
         assert_eq!(tag.attributes[0], attr);
@@ -271,6 +363,7 @@ mod tests {
             name: "div".to_string(),
             self_closing: false,
             attributes: vec![(Some("class".to_string()), "class=\"a\"".to_string())],
+            children: Vec::new(),
         };
         let doc = Fingerprint {
             items: vec![FingerprintItem::Tag(fp), FingerprintItem::Text("text".to_string())],

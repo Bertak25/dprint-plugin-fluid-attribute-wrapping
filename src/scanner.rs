@@ -22,7 +22,7 @@
 //! line/column of the opener (Requirement 7.1).
 
 use crate::dialect::{OpaqueRegion, ScannerProfile};
-use crate::model::{Attribute, AttributeKind, ScannedTag};
+use crate::model::{Attribute, AttributeKind, NestedChild, ScannedTag};
 
 /// The outcome of probing a byte offset for the start of an opaque region.
 ///
@@ -1355,6 +1355,21 @@ fn delimit_start_tag<'a>(
     // byte-for-byte unchanged by the wrap/render stages (Requirements 2.4, 4.9).
     let confidently_rewritable = !in_attr_region_angle && attributes_confident(&attributes);
 
+    // Probe each confidently-delimited braced attribute value for genuine nested
+    // JSX elements and record them as source-relative children (task 4.2,
+    // Requirements 4.10, 3.2). This does NOT change `span`, the attribute `raw`
+    // slices, or `confidently_rewritable`: the element-bearing attribute still
+    // tokenizes as an ordinary `NameValue` whose `raw` is preserved byte-for-byte
+    // (task 4.3 relies on this). Only JSX/TSX dialects — the ones that gate `<`
+    // on expression position — probe; other dialects always get an empty
+    // `children`. A not-confidently-rewritable enclosing tag records no children:
+    // it is already a per-tag no-op, so descent would be wasted work.
+    let children = if confidently_rewritable && profile.scan_child_expression_containers {
+        probe_children(src, open, &attributes, profile, indent_width)?
+    } else {
+        Vec::new()
+    };
+
     Ok(ScannedTag {
         span: span.clone(),
         name,
@@ -1363,7 +1378,313 @@ fn delimit_start_tag<'a>(
         confidently_rewritable,
         open_col,
         base_indent_col,
+        children,
     })
+}
+
+/// Byte offset of the subslice `inner` within the backing buffer `src`.
+///
+/// `inner` must be a subslice of `src` (as every [`Attribute::raw`] produced by
+/// [`tokenize_attributes`] is — it is always `&src[..]`), so the pointer
+/// difference is a valid in-bounds byte offset on a UTF-8 char boundary. This is
+/// how the probe recovers an attribute's absolute source offset without
+/// threading offsets through [`tokenize_attributes`].
+fn subslice_offset(src: &str, inner: &str) -> usize {
+    (inner.as_ptr() as usize).saturating_sub(src.as_ptr() as usize)
+}
+
+/// For a name-value attribute `raw` of the form `name = { … }`, return the byte
+/// offset of the value's opening `{` within `raw`; otherwise `None`.
+///
+/// Returns `None` for a quoted (`name="…"`) or unquoted (`name=val`) value even
+/// when a `{` appears inside it, so a brace buried in a string is never mistaken
+/// for the value's opening brace. The value's opening `{` is the first
+/// non-whitespace byte after the first `=` — it must be exactly `{`.
+fn braced_value_open_offset(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let eq = bytes.iter().position(|&b| b == b'=')?;
+    let mut j = eq + 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    (bytes.get(j) == Some(&b'{')).then_some(j)
+}
+
+/// Probe the confidently-delimited braced attribute values of a start tag that
+/// opens at `open` for genuine nested JSX elements, returning them as source
+/// coordinate children RELATIVE to `open`, each tagged with the owning
+/// attribute's source index and the child's offset within that attribute's
+/// `raw` slice (task 4.2, Requirements 4.10, 3.2, 7.4).
+///
+/// Only name-value attributes whose value is a braced `{ … }` expression are
+/// probed; plain, quoted, unquoted, pure-spread (`{...props}`,
+/// [`AttributeKind::DynamicSpread`]), and not-confidently-delimited
+/// ([`AttributeKind::ComplexExpression`]) attributes are never probed and their
+/// bytes are preserved verbatim. A `<` inside a braced value that is a
+/// TypeScript generic / `<` operator (not in start-tag position) records no
+/// child and is skipped exactly as the main walk skips it, so the generics guard
+/// holds inside attribute values.
+fn probe_children<'a>(
+    src: &'a str,
+    open: usize,
+    attributes: &[Attribute<'a>],
+    profile: &ScannerProfile,
+    indent_width: usize,
+) -> Result<Vec<NestedChild<'a>>, ParseFailure> {
+    let mut children: Vec<NestedChild<'a>> = Vec::new();
+    for (attr_index, attr) in attributes.iter().enumerate() {
+        // Only name-value attributes carry a braced value worth probing. A pure
+        // spread has `name_key == None` and kind `DynamicSpread`; a complex
+        // expression already poisoned confidence and is excluded by the caller.
+        if attr.kind != AttributeKind::NameValue {
+            continue;
+        }
+        // Only a genuine braced VALUE is probed: the attribute must be the
+        // name-value form `name = { … }` whose value begins with `{`. A quoted
+        // or unquoted value is skipped even if a `{` appears inside it (e.g.
+        // `label="a{b}"`), so a brace inside a string is never mistaken for the
+        // value's opening brace.
+        let attr_abs = subslice_offset(src, attr.raw);
+        let Some(rel_brace) = braced_value_open_offset(attr.raw) else {
+            continue;
+        };
+        let brace_open = attr_abs + rel_brace;
+        // The attribute `raw` ends exactly at the matching `}` for a braced
+        // value (the tokenizer captured `name…value` through the delimited
+        // close), so the interior to walk is `[brace_open + 1, brace_end - 1)`
+        // where `brace_end` is one past the attribute's last byte.
+        let brace_end = attr_abs + attr.raw.len();
+        probe_braced_interior(
+            src,
+            open,
+            attr_index,
+            attr_abs,
+            brace_open,
+            brace_end,
+            profile,
+            indent_width,
+            &mut children,
+        )?;
+    }
+    Ok(children)
+}
+
+/// Walk the interior of one braced attribute value `[brace_open, brace_end)`
+/// (where `brace_open` indexes the opening `{` and `brace_end` is one past the
+/// matching `}`), recording each genuine nested JSX element as a
+/// [`NestedChild`] relative to the enclosing tag's `open`.
+///
+/// The walk mirrors the main [`scan_start_tags`] loop's JSX discipline over the
+/// interior: it maintains a running [`LastToken`] (the first significant token
+/// inside the brace is in expression-introducer position, so an interior `<` is
+/// classified exactly as the main walk classifies it), reuses
+/// [`step_in_container`] / [`ContainerFrame`] for child-position descendants, and
+/// consumes strings / template literals / regex literals / comments /
+/// identifiers as whole tokens so a `<` inside any of them is never mistaken for
+/// a tag. A `<` that [`is_start_tag_position`] accepts triggers a recursive
+/// [`delimit_start_tag`] whose absolute span is converted to be relative to
+/// `open` before being pushed; scanning then resumes just past the child, and a
+/// non-self-closing child's element body is walked under the ordinary
+/// child-position container discipline so descendants in child position are
+/// recognized too.
+#[allow(clippy::too_many_arguments)]
+fn probe_braced_interior<'a>(
+    src: &'a str,
+    open: usize,
+    attr_index: usize,
+    attr_abs: usize,
+    brace_open: usize,
+    brace_end: usize,
+    profile: &ScannerProfile,
+    indent_width: usize,
+    children: &mut Vec<NestedChild<'a>>,
+) -> Result<(), ParseFailure> {
+    let bytes = src.as_bytes();
+    // Interior runs from just after `{` to just before the matching `}`.
+    let start = brace_open + 1;
+    let end = brace_end.min(bytes.len()).saturating_sub(1).max(start);
+    let mut i = start;
+    // The first significant token inside a brace is in expression-introducer
+    // position, so a leading `<` is a genuine JSX element — seed `OperatorOrOpen`.
+    let mut last_significant = LastToken::OperatorOrOpen;
+    let mut container_stack: Vec<ContainerFrame> = Vec::new();
+    let mut regex_allowed = true;
+
+    while i < end {
+        // Inside a child-position `{ … }` container opened within this interior,
+        // mirror the container discipline so an interior `}` buried in a string /
+        // template / regex / comment, or inside a nested bracket, never closes it
+        // early (reuses the same helper the main walk uses).
+        if profile.scan_child_expression_containers
+            && bytes[i] == b'{'
+            && matches!(last_significant, LastToken::None | LastToken::TagClose)
+        {
+            container_stack.push(ContainerFrame {
+                open_at: i,
+                interior_depth: 0,
+            });
+            i += 1;
+            last_significant = LastToken::OperatorOrOpen;
+            regex_allowed = true;
+            continue;
+        }
+        if !container_stack.is_empty() {
+            match step_in_container(src, i, regex_allowed, &mut container_stack)? {
+                InteriorStep::Advance { next, last, regex } => {
+                    i = next.max(i + 1);
+                    last_significant = last;
+                    regex_allowed = regex;
+                    continue;
+                }
+                InteriorStep::Fallthrough => {}
+            }
+        }
+
+        if bytes[i] == b'<' {
+            if is_start_tag_position(src, i, last_significant, profile) {
+                let child = delimit_start_tag(src, i, profile, indent_width)?;
+                let child_end = child.span.end;
+                // Record the child with a span RELATIVE to the enclosing tag's
+                // `open`, plus the owning attribute's source index and the
+                // child's offset within that attribute's `raw` (both source
+                // coordinates) so task 4.4 can map source→rendered by attribute
+                // identity without any text search (Finding 3).
+                let rel_span = (child.span.start - open)..(child.span.end - open);
+                let offset_in_attr_raw = child.span.start - attr_abs;
+                children.push(NestedChild {
+                    owner_attr_index: attr_index,
+                    offset_in_attr_raw,
+                    tag: ScannedTag {
+                        span: rel_span,
+                        ..child
+                    },
+                });
+                // Resume just past the child. A recognized opening/self-closing
+                // tag yields child position, so a following `<` is a nested
+                // element; a following `/` inside a container is division.
+                i = child_end.max(i + 1);
+                last_significant = LastToken::TagClose;
+                regex_allowed = false;
+                continue;
+            }
+            // A `<` not in start-tag position is a TypeScript generic / `<`
+            // operator: record no child and skip it as ordinary bytes, exactly
+            // as the main walk does. A following `/` (a `</…>` closing-tag slash)
+            // must not be read as a regex start.
+            i += 1;
+            last_significant = LastToken::OperatorOrOpen;
+            regex_allowed = false;
+            continue;
+        }
+
+        // Ordinary (non-`<`, non-skipped) byte: consume it and recompute the
+        // running classification exactly as the main walk does.
+        let step = step_ordinary_probe_byte(src, i, end, last_significant, regex_allowed)?;
+        i = step.next.max(i + 1);
+        last_significant = step.last;
+        regex_allowed = step.regex;
+    }
+
+    Ok(())
+}
+
+/// The result of consuming one ordinary (non-`<`, non-container) byte in a
+/// braced attribute-value interior walk (see [`step_ordinary_probe_byte`]).
+struct OrdinaryStep {
+    /// Byte offset to resume from (the caller clamps to at least `i + 1`).
+    next: usize,
+    /// Updated running token classification.
+    last: LastToken,
+    /// Whether a `/` at `next` may begin a regex literal.
+    regex: bool,
+}
+
+/// Consume one ordinary byte at `i` inside a braced attribute-value interior and
+/// return the updated walk state, mirroring [`delimit_braced`]'s lexical
+/// discipline: strings and template literals are consumed whole (a `<` inside
+/// them is never a tag), regex literals and comments are skipped whole, keywords
+/// that introduce an expression are classified as such, and every other byte is
+/// classified via [`classify_byte`].
+///
+/// Returns a [`ParseFailure`] only for an unterminated block comment at end of
+/// input (Requirement 7.1), located at its opener.
+fn step_ordinary_probe_byte(
+    src: &str,
+    i: usize,
+    end: usize,
+    last_significant: LastToken,
+    regex_allowed: bool,
+) -> Result<OrdinaryStep, ParseFailure> {
+    let bytes = src.as_bytes();
+    let value = |next: usize| OrdinaryStep {
+        next,
+        last: LastToken::Ident,
+        regex: false,
+    };
+    let operator = |next: usize, regex: bool| OrdinaryStep {
+        next,
+        last: LastToken::OperatorOrOpen,
+        regex,
+    };
+
+    let b = bytes[i];
+    let step = match b {
+        b'\'' | b'"' => match scan_js_string(src, i + 1, b, end) {
+            Some(next) => value(next),
+            // Unterminated string: treat the quote as an ordinary byte.
+            None => operator(i + 1, regex_allowed),
+        },
+        b'`' => match scan_template_literal_whole(src, i + 1, end) {
+            Some(next) => value(next),
+            None => operator(i + 1, regex_allowed),
+        },
+        // Line comment: skip whole; a newline permits a regex after.
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            operator(skip_line_comment(bytes, i + 2, end), true)
+        }
+        // Block comment: skip whole; unterminated at EOF is a hard failure.
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let Some(next) = skip_block_comment(bytes, i + 2, end) else {
+                return Err(ParseFailure::at(
+                    src,
+                    i,
+                    "unterminated braced expression at end of input",
+                ));
+            };
+            operator(next, false)
+        }
+        // Regex literal where a `/` may start one: skip whole. An unterminated
+        // regex is treated conservatively as division.
+        b'/' if regex_allowed => match scan_regex_literal(src, i + 1, end) {
+            Some(next) => value(next),
+            None => operator(i + 1, true),
+        },
+        // Division operator; an operator means a regex may follow.
+        b'/' => operator(i + 1, true),
+        _ if is_ident_start_byte(b) => {
+            let word_end = scan_ident_run(bytes, i);
+            if is_expression_keyword(&src[i..word_end]) {
+                operator(word_end, true)
+            } else {
+                value(word_end)
+            }
+        }
+        _ => {
+            let (last, regex) = match classify_byte(b) {
+                Some(classified) => (classified, classified == LastToken::OperatorOrOpen),
+                // Whitespace / non-significant: leave BOTH the classification and
+                // the regex context unchanged (transparent), exactly as the main
+                // walk and `delimit_braced` do.
+                None => (last_significant, regex_allowed),
+            };
+            OrdinaryStep {
+                next: i + utf8_len(b),
+                last,
+                regex,
+            }
+        }
+    };
+    Ok(step)
 }
 
 /// A start tag's element name runs across ASCII alphanumerics and the joiner
@@ -1520,6 +1841,25 @@ fn delimit_braced(src: &str, from: usize, end: usize) -> (usize, bool) {
                     Some(next) => i = next,
                     None => return (fallback(), false),
                 }
+            }
+            // ---- JSX closing-tag slash ----------------------------------
+            // A `/` IMMEDIATELY preceded by a `<` is the slash of a JSX closing
+            // tag (`</name>`), never a regex-literal start. Without this guard
+            // an element-bearing attribute value whose inner element carries an
+            // end tag (`primary={ <a>…</a> }`) leaves `regex_allowed == true` at
+            // the `<` of `</a>` (a `<` is an expression introducer, classified
+            // as regex-permitting by `byte_allows_regex_after`), so the `/`
+            // would enter the `scan_regex_literal` arm below, run off to end of
+            // input, and report the value not-confident — poisoning the
+            // enclosing tag into a no-op. Mirror the identical guard in the main
+            // `scan_start_tags` walk and treat the `/` as division. Pure index
+            // arithmetic (`i > from && bytes[i-1] == b'<'`) cannot read out of
+            // bounds. This only ever SUPPRESSES a spurious regex read after `<`;
+            // a `/` not preceded by `<` is unaffected, so values with no `</`
+            // delimit to a byte-identical span.
+            b'/' if i > from && bytes[i - 1] == b'<' => {
+                i += 1;
+                regex_allowed = false;
             }
             // ---- regex vs division --------------------------------------
             b'/' if regex_allowed => match scan_regex_literal(src, i + 1, end) {
@@ -1718,6 +2058,22 @@ fn byte_allows_regex_after(b: u8) -> bool {
         return false;
     }
     true
+}
+
+/// Public re-export of [`column_geometry`] for the engine's child-geometry
+/// recompute (task 4.4, Finding 4).
+///
+/// After the enclosing tag is wrapped, a nested child's source column no longer
+/// reflects where its `<` lands in the rendered output. The engine therefore
+/// recomputes the child's `(open_col, base_indent_col)` from the RENDERED buffer
+/// at the child's rendered `<` offset, using **exactly** this shared
+/// tab = `indent_width` / [`crate::model::display_width`] model so the geometry
+/// agrees with how the scanner measured every other tag and so the two
+/// idempotence passes read the identical column from the identical buffer
+/// position (Requirement 8.5).
+#[must_use]
+pub fn column_geometry_at(src: &str, open: usize, indent_width: usize) -> (usize, usize) {
+    column_geometry(src, open, indent_width)
 }
 
 /// Compute `(open_col, base_indent_col)` for a start tag whose `<` is at byte
@@ -2907,6 +3263,101 @@ mod confidence_tests {
         assert!(!confident);
     }
 
+    // ---- Design Decision 0: the `</` regex guard (task 1.2) --------------
+    //
+    // These tests pin the behavior of the `</`-regex guard added in task 1.1.
+    // Before the guard, an element-bearing attribute value whose inner element
+    // carries a closing `</…>` tag delimited `confident == false` (the `<` of
+    // the closing tag left `regex_allowed == true`, so the following `/` was
+    // read as a regex literal that ran off to end of input), which poisoned the
+    // enclosing tag into a `ComplexExpression` no-op. The guard treats a `/`
+    // immediately after a `<` as a JSX closing-tag slash, so these values now
+    // delimit confidently. Crucially the guard only ever SUPPRESSES a spurious
+    // regex read right after `<`, so a genuine regex literal and any value with
+    // no `</` at all are unaffected.
+
+    #[test]
+    fn delimit_braced_confident_on_end_tag_bearing_inner_element() {
+        // `{<a className="x">t</a>}` — the inner `<a>` carries a closing `</a>`.
+        // Before the guard this was `confident == false`; now it is confident
+        // and the delimited span is the whole braced value.
+        let src = r#"{<a className="x">t</a>}X"#;
+        let (end, confident) = delimit_braced(src, 0, src.len());
+        assert!(confident, "end-tag-bearing inner element must delimit confidently");
+        assert_eq!(&src[..end], r#"{<a className="x">t</a>}"#);
+        assert_eq!(&src[end..], "X");
+    }
+
+    #[test]
+    fn delimit_braced_confident_on_nested_end_tag_bearing_elements() {
+        // `{<span><Chip/></span>}` — an outer `<span>…</span>` with a nested
+        // self-closing `<Chip/>`. The two `</…>` closers (and `/>`) must not be
+        // read as regex literals. Before the guard this was `confident == false`.
+        let src = "{<span><Chip/></span>}Y";
+        let (end, confident) = delimit_braced(src, 0, src.len());
+        assert!(confident, "nested end-tag-bearing elements must delimit confidently");
+        assert_eq!(&src[..end], "{<span><Chip/></span>}");
+        assert_eq!(&src[end..], "Y");
+    }
+
+    #[test]
+    fn delimit_braced_confident_on_self_closing_inner_element() {
+        // `{<a className="x" />}` — a self-closing inner element. This case was
+        // ALREADY confident before the guard (no `</…>` closer), so on its own
+        // it would give false confidence in the guard; it is included only to
+        // show the guard does not regress the already-confident path. The
+        // end-tag-bearing cases above are the mandatory ones.
+        let src = r#"{<a className="x" />}Z"#;
+        let (end, confident) = delimit_braced(src, 0, src.len());
+        assert!(confident, "self-closing inner element must delimit confidently");
+        assert_eq!(&src[..end], r#"{<a className="x" />}"#);
+        assert_eq!(&src[end..], "Z");
+    }
+
+    #[test]
+    fn delimit_braced_confident_on_genuine_regex_not_preceded_by_lt() {
+        // `{re.test(/a}b/)}` — a genuine regex literal `/a}b/` whose `/` is NOT
+        // preceded by `<`. The guard only suppresses a regex read immediately
+        // after `<`, so this `/` is still read as a regex: the `}` inside the
+        // regex does NOT close the brace early, and the value delimits
+        // confidently to the outer `}`.
+        let src = "{re.test(/a}b/)}tail";
+        let (end, confident) = delimit_braced(src, 0, src.len());
+        assert!(confident, "a genuine regex literal must still delimit confidently");
+        assert_eq!(&src[..end], "{re.test(/a}b/)}");
+        assert_eq!(&src[end..], "tail");
+    }
+
+    #[test]
+    fn delimit_braced_span_unchanged_for_values_without_slash_lt() {
+        // Values with no `</` at all — template literals, arrows, ternaries, TS
+        // generics, and `<` operators — delimit to exactly the span the
+        // pre-guard lexer produced. The guard's condition (`bytes[i-1] == b'<'`)
+        // never fires for these, so each resolves to its matching outer `}` with
+        // `confident == true`, and TS generics / `<` operators are not misread
+        // as tags (no `>` ever closes the brace; only the balanced `}` does).
+        let cases = [
+            // template literal
+            ("{`${a}-${b}`}", "rest"),
+            // arrow function
+            ("{() => handleRun(id)}", "X"),
+            // ternary with arrow
+            ("{can ? () => run() : undefined}", "Y"),
+            // TS generics: `useState<Array<Task>>()` — the `<`/`>` are generic
+            // brackets, never tag delimiters; only the outer `}` closes.
+            ("{useState<Array<Task>>()}", "Z"),
+            // `<` comparison operator
+            ("{a < b}", "W"),
+        ];
+        for (braced, tail) in cases {
+            let src = format!("{braced}{tail}");
+            let (end, confident) = delimit_braced(&src, 0, src.len());
+            assert!(confident, "value without `</` must delimit confidently: {braced}");
+            assert_eq!(&src[..end], braced, "delimited span must equal the braced value: {braced}");
+            assert_eq!(&src[end..], tail, "scanning must resume just past the value: {braced}");
+        }
+    }
+
     #[test]
     fn scan_js_string_honors_escapes() {
         // The escaped closing quote does not end the string.
@@ -3127,6 +3578,392 @@ mod confidence_model_tests {
         // bytes, so reverting B never disturbs A or C.
         assert_eq!(&src[confident[0].span.clone()], "<A x={1} />");
         assert_eq!(&src[confident[1].span.clone()], "<C y=\"z\" />");
+    }
+
+    // ---- task 4.2: element-bearing attribute values record children ------
+
+    /// Resolve a child's ABSOLUTE source span from its enclosing tag: the child
+    /// span is stored relative to the enclosing tag's `span.start`, so adding it
+    /// back recovers the original buffer offsets. Used to assert the stored
+    /// relative span round-trips to the exact child bytes.
+    fn child_abs<'a>(src: &'a str, enclosing: &ScannedTag<'_>, child: &NestedChild<'_>) -> &'a str {
+        let base = enclosing.span.start;
+        &src[base + child.tag.span.start..base + child.tag.span.end]
+    }
+
+    #[test]
+    fn self_closing_element_in_attribute_value_is_recorded_as_child() {
+        // The enclosing tag stays whole + confidently rewritable; the braced
+        // `primary={ <Chip ... /> }` tokenizes as an ordinary NameValue and the
+        // inner `<Chip/>` is recorded as a single child (Requirements 4.10, 3.2).
+        let src = "<ListItemText id={1} primary={ <Chip size={\"small\"} color={c} /> } />";
+        let tag = one_tag(src);
+
+        // Enclosing tag unchanged by the probe.
+        assert!(tag.confidently_rewritable);
+        assert_eq!(&src[tag.span.clone()], src);
+        assert_eq!(tag.name, "ListItemText");
+
+        // Exactly one child was recorded.
+        assert_eq!(tag.children.len(), 1, "one nested element");
+        let child = &tag.children[0];
+        assert_eq!(child.tag.name, "Chip");
+        assert!(child.tag.self_closing);
+
+        // The relative span round-trips to the exact child start-tag bytes.
+        assert_eq!(child_abs(src, &tag, child), "<Chip size={\"small\"} color={c} />");
+
+        // Provenance: the owning attribute is `primary` (source index 1), and
+        // the intra-raw offset points at the child's `<` within `primary`'s raw.
+        assert_eq!(child.owner_attr_index, 1);
+        let owner = &tag.attributes[child.owner_attr_index];
+        assert_eq!(owner.name_key.as_deref(), Some("primary"));
+        assert!(
+            owner.raw[child.offset_in_attr_raw..].starts_with("<Chip"),
+            "offset_in_attr_raw must point at the child's `<` within the owner raw: {:?}",
+            &owner.raw[child.offset_in_attr_raw..]
+        );
+    }
+
+    #[test]
+    fn end_tag_bearing_element_in_attribute_value_is_recorded() {
+        // An inner element that carries a `</…>` end tag (exercises Decision 0 /
+        // task 1): the enclosing tag is confident and the inner `<a>` start tag
+        // is recorded as a child. `delimit_start_tag` records only the START tag
+        // span, so the child span is `<a href="x">` through its `>`.
+        let src = "<Item primary={ <a href=\"x\">label</a> } />";
+        let tag = one_tag(src);
+        assert!(tag.confidently_rewritable);
+        assert_eq!(tag.children.len(), 1);
+        let child = &tag.children[0];
+        assert_eq!(child.tag.name, "a");
+        assert!(!child.tag.self_closing);
+        assert_eq!(child_abs(src, &tag, child), "<a href=\"x\">");
+    }
+
+    #[test]
+    fn child_position_descendant_in_attribute_value_is_recorded() {
+        // `<Stack ...><IconButton .../></Stack>` inside an attribute value: both
+        // the opening `<Stack>` and the child-position `<IconButton/>` are
+        // recorded, because after the `<Stack>` `>` the walk resumes at child
+        // position and recognizes the adjacent `<IconButton` (no text between).
+        let src =
+            "<Row action={ <Stack direction={\"row\"}><IconButton onClick={f} /></Stack> } />";
+        let tag = one_tag(src);
+        assert!(tag.confidently_rewritable);
+        let names: Vec<_> = tag.children.iter().map(|c| c.tag.name).collect();
+        assert_eq!(names, vec!["Stack", "IconButton"]);
+        // Both children belong to the same owning attribute (`action`).
+        assert!(tag.children.iter().all(|c| c.owner_attr_index == 0));
+        assert_eq!(child_abs(src, &tag, &tag.children[1]), "<IconButton onClick={f} />");
+    }
+
+    #[test]
+    fn arbitrary_depth_nesting_is_recorded_recursively() {
+        // `a={ <X b={ <Y c={ <Z /> } /> } />` — each genuine element nests one
+        // level deeper via the child's own `children`, so the tree has depth 3.
+        let src = "<T a={ <X b={ <Y c={ <Z /> } /> } /> } />";
+        let tag = one_tag(src);
+        assert_eq!(tag.children.len(), 1);
+        let x = &tag.children[0].tag;
+        assert_eq!(x.name, "X");
+        assert_eq!(x.children.len(), 1);
+        let y = &x.children[0].tag;
+        assert_eq!(y.name, "Y");
+        assert_eq!(y.children.len(), 1);
+        let z = &y.children[0].tag;
+        assert_eq!(z.name, "Z");
+        assert_eq!(z.children.len(), 0, "deepest element has no further children");
+    }
+
+    #[test]
+    fn generic_in_attribute_value_records_no_child() {
+        // A TypeScript generic / `<` operator inside a braced attribute value is
+        // in value position (`Ident`), so it is NOT a start tag: no child is
+        // recorded and the enclosing tag stays confident (the generics guard
+        // holds inside attribute values).
+        for src in [
+            "<Comp value={useState<Array<Task>>()} />",
+            "<Comp cfg={axios.get<Array<Url>>(u)} />",
+            "<Comp disabled={a < b} />",
+            "<Comp onClick={() => arr.map<T>(x => x)} />",
+        ] {
+            let tag = one_tag(src);
+            assert!(
+                tag.confidently_rewritable,
+                "generic value keeps the tag confident: {src:?}"
+            );
+            assert!(
+                tag.children.is_empty(),
+                "a generic/`<`-operator records no child: {src:?} -> {:?}",
+                tag.children.iter().map(|c| c.tag.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn pure_spread_is_never_probed() {
+        // `{...props}` is a DynamicSpread with no `name=`, never an attribute
+        // value, so it is never probed and records no child — even though a `<`
+        // could theoretically appear in a spread expression, the kind gate
+        // excludes it. Here there is no element anyway; assert no children.
+        let src = "<Comp {...props} id={1} />";
+        let tag = one_tag(src);
+        assert!(tag.confidently_rewritable);
+        assert_eq!(tag.children.len(), 0, "a pure spread is never probed");
+    }
+
+    #[test]
+    fn non_jsx_dialects_never_record_children() {
+        // HTML has no braced attribute values and does not gate `<` on
+        // expression position, so `children` is always empty.
+        let html = Dialect::Html.scanner_profile();
+        let tags = scan_start_tags("<div class=\"a\" id=\"b\">", &html, 2).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].children.len(), 0, "non-JSX dialects never record children");
+    }
+
+    #[test]
+    fn string_and_template_content_in_attribute_value_is_not_a_child() {
+        // A `<` inside a string / template literal in the attribute value must
+        // not be mistaken for a tag (consumed as a whole token).
+        let src = "<Comp label={\"<not-a-tag>\"} tpl={`a<b ${x}`} />";
+        let tag = one_tag(src);
+        assert!(tag.confidently_rewritable);
+        assert!(
+            tag.children.is_empty(),
+            "no child from string/template content: {:?}",
+            tag.children.iter().map(|c| c.tag.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn quoted_value_containing_a_brace_is_not_probed() {
+        // A quoted value whose text contains `{` and a `<` must NOT be probed:
+        // the value's opening delimiter is the quote, not the interior `{`, so
+        // the `<` inside the string is never mistaken for a nested element.
+        let src = "<Comp label=\"a{<b>}c\" id={1} />";
+        let tag = one_tag(src);
+        assert!(tag.confidently_rewritable);
+        assert_eq!(
+            tag.children.len(),
+            0,
+            "a brace inside a quoted value is not a braced value: {:?}",
+            tag.children.iter().map(|c| c.tag.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn two_identical_inner_elements_record_distinct_children_by_identity() {
+        // Two identical `<a .../>` in DIFFERENT attribute values: each is keyed
+        // to its own owning attribute index + intra-raw offset, so identity is
+        // unambiguous even though the `raw` substrings are identical (Finding 3).
+        let src = "<Row first={ <a href=\"x\" /> } second={ <a href=\"x\" /> } />";
+        let tag = one_tag(src);
+        assert_eq!(tag.children.len(), 2);
+        assert_eq!(tag.children[0].tag.name, "a");
+        assert_eq!(tag.children[1].tag.name, "a");
+        // Distinct owning attributes.
+        assert_eq!(
+            tag.attributes[tag.children[0].owner_attr_index].name_key.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            tag.attributes[tag.children[1].owner_attr_index].name_key.as_deref(),
+            Some("second")
+        );
+        // Each offset points at its own owner's `<a`.
+        for c in &tag.children {
+            let owner = &tag.attributes[c.owner_attr_index];
+            assert!(owner.raw[c.offset_in_attr_raw..].starts_with("<a "));
+        }
+    }
+
+    #[test]
+    fn not_confidently_rewritable_enclosing_tag_records_no_children() {
+        // A genuinely ambiguous braced value (mismatched brackets) poisons the
+        // enclosing tag; descent is suppressed, so even a real element in a
+        // DIFFERENT attribute value is not recorded (the whole tag is a no-op).
+        let src = "<Comp bad={ [a, b) } good={ <Chip x={1} /> } />";
+        let tag = one_tag(src);
+        assert!(!tag.confidently_rewritable);
+        assert!(
+            tag.children.is_empty(),
+            "a not-confidently-rewritable tag records no children"
+        );
+    }
+
+    // ---- task 4.3: enclosing-tag invariants + flat top-level resume ------
+
+    #[test]
+    fn element_bearing_attribute_value_keeps_enclosing_tag_whole_and_confident() {
+        // Case (a): an enclosing tag with an element-bearing, confidently
+        // delimited attribute value stays confidently_rewritable and its span
+        // runs from the `<` through the closing `/>` — the element-bearing `{`
+        // does NOT truncate the span, and the nested element does NOT poison
+        // confidence (Requirements 2.5, 2.6, 2.8, 4.9, 4.10). The real-world
+        // `<TaskStatisticListItem>` shape is used so the invariant is asserted on
+        // the exact bug fixture, not just a toy.
+        let src = "<TaskStatisticListItem key={k} index={i} status={s} exists={e} \
+primary={ <a className=\"c\" href=\"/x\">label</a> } onRun={r} onDelete={d} />";
+        let tag = one_tag(src);
+
+        // Span runs through the closing `/>` — whole tag, untruncated.
+        assert_eq!(&src[tag.span.clone()], src, "enclosing span runs through `/>`");
+        assert!(src[tag.span.clone()].ends_with("/>"), "span ends at the self-close `/>`");
+        assert_eq!(tag.name, "TaskStatisticListItem");
+        assert!(tag.self_closing);
+
+        // Confidence is unaffected by the nested element in a confident value.
+        assert!(
+            tag.confidently_rewritable,
+            "a nested element in a confidently-delimited value does not poison confidence"
+        );
+
+        // The enclosing tag keeps ALL of its own top-level attributes (key,
+        // index, status, exists, primary, onRun, onDelete = seven), and the
+        // element-bearing `primary` tokenizes as an ordinary NameValue whose raw
+        // is preserved byte-for-byte (the probe never splits it out).
+        assert_eq!(tag.attributes.len(), 7, "all seven top-level attributes retained");
+        let primary = tag
+            .attributes
+            .iter()
+            .find(|a| a.name_key.as_deref() == Some("primary"))
+            .expect("primary attribute present");
+        assert_eq!(primary.kind, AttributeKind::NameValue);
+        assert_eq!(primary.raw, "primary={ <a className=\"c\" href=\"/x\">label</a> }");
+
+        // The nested `<a>` lives ONLY in children, never as a top-level sibling.
+        assert_eq!(tag.children.len(), 1);
+        assert_eq!(tag.children[0].tag.name, "a");
+    }
+
+    #[test]
+    fn scan_produces_flat_non_overlapping_source_ordered_top_level_list() {
+        // Case (b): across several sibling TOP-LEVEL tags in genuine JSX child
+        // position (adjacent inside a fragment, separated only by transparent
+        // whitespace so each `<` stays in expression/child position),
+        // `scan_start_tags` yields a FLAT list — nested attribute-value elements
+        // are recorded only in `children`, never promoted into the flat list —
+        // and the flat spans are non-overlapping and strictly source-ordered,
+        // exactly as the engine splice requires. The middle tag carries a nested
+        // `<Chip/>` child; the flat list must be
+        // `[Fragment-open, Row, ListItemText, Footer]` with NO `Chip`.
+        let src = "<>\n\
+<Row a={1} />\n\
+<ListItemText primary={p} secondary={ <Chip size={\"sm\"} color={c} /> } />\n\
+<Footer b={2} />\n\
+</>";
+        let tags = scan_start_tags(src, &jsx(), 2).expect("scan succeeds");
+
+        // Flat list is exactly the TOP-LEVEL tags in source order; the nested
+        // `<Chip/>` is NOT present as a top-level entry. (The fragment opener
+        // `<>` has no name-start char, so it is not recorded as a tag.)
+        let names: Vec<_> = tags.iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["Row", "ListItemText", "Footer"], "flat top-level list");
+        assert!(
+            !names.contains(&"Chip"),
+            "a nested attribute-value element must NOT appear in the flat list"
+        );
+
+        // The nested element is recorded under the middle tag's children only.
+        let middle = tags.iter().find(|t| t.name == "ListItemText").unwrap();
+        assert_eq!(middle.children.len(), 1);
+        assert_eq!(middle.children[0].tag.name, "Chip");
+
+        // Spans are strictly source-ordered and non-overlapping: each tag starts
+        // at or after the previous tag's end (the main walk resumed at
+        // `tag.span.end` and never re-entered an attribute container).
+        for pair in tags.windows(2) {
+            assert!(
+                pair[0].span.end <= pair[1].span.start,
+                "flat spans must be non-overlapping and source-ordered: {:?} then {:?}",
+                pair[0].span,
+                pair[1].span
+            );
+        }
+
+        // Each flat span round-trips to its exact element bytes.
+        assert_eq!(&src[tags[0].span.clone()], "<Row a={1} />");
+        assert_eq!(
+            &src[tags[1].span.clone()],
+            "<ListItemText primary={p} secondary={ <Chip size={\"sm\"} color={c} /> } />"
+        );
+        assert_eq!(&src[tags[2].span.clone()], "<Footer b={2} />");
+    }
+
+    #[test]
+    fn enclosing_component_generics_head_poisons_and_suppresses_descent() {
+        // Case (c), enclosing side: an enclosing tag that is itself a
+        // component-with-generics head (a `<` in its attribute region) is
+        // not-confidently-rewritable, so descent is suppressed — NO child is
+        // probed for it and the head itself is a per-tag no-op (Requirements
+        // 2.6, 4.9). (The component-generics head is delimited up to its first
+        // inner generic `>`, pre-existing Change-3 behavior; what task 4.3 pins
+        // down is that such a head NEVER probes children.)
+        let src = "<Select<Array<number>> value={v} slot={ <Chip x={1} /> }>";
+        let tags = scan_start_tags(src, &jsx(), 2).expect("scan succeeds");
+        let head = tags
+            .iter()
+            .find(|t| t.name == "Select")
+            .expect("the component head is recorded");
+        assert!(
+            !head.confidently_rewritable,
+            "a component-with-generics head is not confidently rewritable"
+        );
+        assert!(
+            head.children.is_empty(),
+            "descent is suppressed for a not-confidently-rewritable enclosing tag"
+        );
+    }
+
+    #[test]
+    fn nested_component_generics_head_child_carries_its_own_lost_confidence() {
+        // Case (c), child side: a confident enclosing tag whose attribute value
+        // contains a component-with-generics head records that head as a child,
+        // and the CHILD independently carries its own lost confidence (its own
+        // `<` in its attribute region poisons only itself, Requirement 2.4/4.9),
+        // while the enclosing tag stays confident. Each child carries its own
+        // confidence flag.
+        let src = "<Row slot={ <EditableList<SearchEngineDomain> a=\"1\" /> } id={2} />";
+        let tag = one_tag(src);
+        assert!(
+            tag.confidently_rewritable,
+            "the enclosing tag's own attributes are all confident"
+        );
+        assert_eq!(tag.children.len(), 1, "the generics-head child is recorded");
+        let child = &tag.children[0];
+        assert_eq!(child.tag.name, "EditableList");
+        assert!(
+            !child.tag.confidently_rewritable,
+            "the nested component-generics head carries its OWN lost confidence"
+        );
+    }
+
+    #[test]
+    fn genuinely_ambiguous_value_anywhere_in_attr_value_poisons_enclosing_and_suppresses_descent() {
+        // Case (c) variant: a genuinely ambiguous braced region (mismatched
+        // brackets) appearing ANYWHERE inside an enclosing tag's braced
+        // attribute value — even nested within an inner element — makes
+        // `delimit_braced` lose confidence for that whole top-level value, which
+        // poisons the enclosing tag (ComplexExpression). A
+        // not-confidently-rewritable enclosing tag suppresses descent, so NO
+        // child is probed: the whole tag is a byte-for-byte no-op (Requirements
+        // 2.6, 4.9, 7.4). This is the conservative, safe behavior — the plugin
+        // declines to rewrite rather than guess at an ambiguous expression.
+        let src = "<Row slot={ <Chip bad={ [a, b) } /> } id={2} />";
+        let tag = one_tag(src);
+        assert!(
+            !tag.confidently_rewritable,
+            "an ambiguous region inside a braced value poisons the enclosing tag"
+        );
+        assert!(
+            tag.children.is_empty(),
+            "descent is suppressed for a not-confidently-rewritable enclosing tag"
+        );
+        // The whole tag span is still recorded verbatim so the walk resumes
+        // correctly past it.
+        assert_eq!(&src[tag.span.clone()], src);
     }
 }
 
@@ -3822,6 +4659,7 @@ mod generics_bug_exploration {
             name: "Array".to_string(),
             self_closing: false,
             attributes: vec![(Some("task".to_string()), "Task".to_string())],
+            children: Vec::new(),
         };
         let symmetric_items = || {
             vec![

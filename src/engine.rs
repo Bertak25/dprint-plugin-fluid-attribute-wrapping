@@ -21,8 +21,8 @@ use std::path::Path;
 use crate::config::Configuration;
 use crate::dialect::{Dialect, ScannerProfile};
 use crate::model::ScannedTag;
-use crate::render::{render_start_tag, Newline};
-use crate::scanner::scan_start_tags;
+use crate::render::{render_start_tag_with_offsets, Newline};
+use crate::scanner::{column_geometry_at, scan_start_tags};
 use crate::sort::{sort_attributes, AttributeOrderScheme};
 use crate::verify::{
     angle_brackets_conserved, fingerprints_equivalent, structural_fingerprint, tag_fingerprint,
@@ -315,12 +315,16 @@ fn rewrite_tag(
 ) -> String {
     // Layer 1 (Requirement 4.9): a tag the scanner could not delimit with full
     // confidence is emitted byte-for-byte unchanged and never wrapped or sorted.
+    // A not-confidently-rewritable tag records no children, so there is nothing
+    // to descend into either.
     if !tag.confidently_rewritable {
         return src_tag.to_string();
     }
 
     // Sort precedes wrap (Requirement 5.6): build the candidate tag with the
-    // (possibly reordered) attributes before rendering decides line breaks.
+    // (possibly reordered) attributes before rendering decides line breaks. Only
+    // the TOP-LEVEL attributes are sorted here; each child is sorted (and
+    // wrapped) independently by its own recursive `rewrite_tag`.
     let candidate = if sorting {
         ScannedTag {
             attributes: sort_attributes(&tag.attributes, scheme),
@@ -330,36 +334,183 @@ fn rewrite_tag(
         tag.clone()
     };
 
-    let rendered = render_start_tag(&candidate, config, newline, src_tag);
+    // Render the enclosing tag's own attributes, recording where each attribute
+    // landed in the rendered text (Finding 3). The child bytes are still verbatim
+    // at this point — the renderer re-emits every `attr.raw` unchanged — so the
+    // enclosing self-check below compares like-for-like.
+    let (rendered, attr_offsets) =
+        render_start_tag_with_offsets(&candidate, config, newline, src_tag);
 
-    // Per-tag structure-equivalence self-check (Requirement 7.6). Re-scan the
-    // rendered tag under the SAME dialect profile and compare its fingerprint
-    // against the original tag's. The rendered text is a complete start tag, so
-    // scanning it yields exactly one tag; anything else is treated as divergence
-    // and reverts this tag. The document-level backstop is the final guard
-    // either way.
+    // Per-tag structure-equivalence self-check for the ENCLOSING tag, run BEFORE
+    // any child splicing (Finding 5, Requirement 7.6). Re-scan the rendered tag
+    // under the SAME dialect profile and compare its fingerprint against the
+    // original tag's; the angle-bracket-conservation invariant is checked over
+    // this tag's original vs rewritten span. Because the child bytes are still
+    // verbatim in `rendered`, the fingerprint recursion over `children` and the
+    // angle-bracket counts both match like-for-like, so this check sees only the
+    // enclosing tag's own change. On divergence, revert the WHOLE enclosing tag
+    // to its original bytes (which also discards any child rewrites — correct,
+    // since the enclosing rewrite is unsafe).
     let before = tag_fingerprint(tag);
     let indent_width = usize::from(config.indent_width);
     let after = match scan_start_tags(&rendered, profile, indent_width) {
         Ok(scanned) if scanned.len() == 1 => tag_fingerprint(&scanned[0]),
         _ => return src_tag.to_string(),
     };
-
-    // The rewrite is kept only when it is structure-preserving under BOTH the
-    // tag-local fingerprint comparison AND the angle-bracket-conservation
-    // invariant applied over this tag's original vs rewritten span. The latter
-    // localizes a dropped-`<`/`>` divergence (e.g. a generic head misread as a
-    // start tag) to this single tag, so it is reverted here as a per-tag no-op
-    // (Requirement 7.6) before the document-level backstop would otherwise have
-    // to raise it (Requirement 7.7).
-    if tag_fingerprints_equivalent(&before, &after, sorting)
-        && angle_brackets_conserved(src_tag, &rendered)
+    if !(tag_fingerprints_equivalent(&before, &after, sorting)
+        && angle_brackets_conserved(src_tag, &rendered))
     {
-        rendered
-    } else {
         // Per-tag revert: keep only this tag's original bytes.
-        src_tag.to_string()
+        return src_tag.to_string();
     }
+
+    // The enclosing rewrite is safe. Splice each nested child into its own
+    // disjoint region of the rendered output (Finding 3/4). Tags with no
+    // children (the overwhelming common case, and every non-JSX/TSX dialect)
+    // take the cheap early path below.
+    if tag.children.is_empty() {
+        return rendered;
+    }
+
+    splice_children(
+        tag,
+        &candidate,
+        &rendered,
+        &attr_offsets,
+        config,
+        profile,
+        newline,
+        sorting,
+        scheme,
+    )
+}
+
+/// Splice each nested child's own recursive rewrite into the enclosing tag's
+/// `rendered` output, mapping source coordinates to rendered coordinates by
+/// attribute IDENTITY via the render stage's `attr_offsets` table (Finding 3),
+/// and recomputing each child's wrapping geometry from its RENDERED position
+/// (Finding 4). Returns the composed enclosing+children text.
+///
+/// The splice is a single monotonic left-to-right pass over disjoint child
+/// regions: children are ordered by their rendered start before splicing, so the
+/// pass stays total and never overlaps a region (Requirement 7.9). Every slice
+/// of `rendered` is bounds-checked and taken on byte offsets derived by adding a
+/// char-boundary intra-`raw` offset to a verbatim `raw` start, so the pass is
+/// panic-free on any valid UTF-8 input.
+#[allow(clippy::too_many_arguments)]
+fn splice_children(
+    tag: &ScannedTag<'_>,
+    candidate: &ScannedTag<'_>,
+    rendered: &str,
+    attr_offsets: &[usize],
+    config: &Configuration,
+    profile: &ScannerProfile,
+    newline: Newline,
+    sorting: bool,
+    scheme: &AttributeOrderScheme,
+) -> String {
+    let indent_width = usize::from(config.indent_width);
+
+    // 1. Compute each child's rendered byte region by attribute identity. The
+    //    stored child provenance (`owner_attr_index` + `offset_in_attr_raw`) is
+    //    SOURCE coordinates; we translate it to the rendered buffer via the
+    //    identity-keyed offset table, NEVER by a substring search (Finding 3).
+    let mut regions: Vec<(usize, usize, &crate::model::NestedChild<'_>)> =
+        Vec::with_capacity(tag.children.len());
+    for child in &tag.children {
+        // Identity of the owning source attribute.
+        let Some(owner) = tag.attributes.get(child.owner_attr_index) else {
+            // A provenance index that does not name a real attribute cannot be
+            // mapped; skip the splice for this child, leaving its bytes verbatim.
+            // The document-level backstop still guards the whole buffer.
+            continue;
+        };
+        // Find where that SAME attribute landed in the rendered output: the
+        // render-order position whose `raw` slice is the identical borrow (same
+        // pointer + length). Sorting permutes `candidate.attributes` but never
+        // clones the underlying `&str`, so pointer identity is stable.
+        let Some(attr_rendered_start) = candidate
+            .attributes
+            .iter()
+            .position(|a| {
+                std::ptr::eq(a.raw.as_ptr(), owner.raw.as_ptr()) && a.raw.len() == owner.raw.len()
+            })
+            .and_then(|pos| attr_offsets.get(pos).copied())
+        else {
+            continue;
+        };
+
+        let child_raw_len = child.tag.span.end - child.tag.span.start;
+        let child_rendered_start = attr_rendered_start + child.offset_in_attr_raw;
+        let child_rendered_end = child_rendered_start + child_raw_len;
+
+        // Bounds-check before any slice (Requirement 7.9). The region must lie
+        // fully within `rendered` and on char boundaries.
+        if child_rendered_end > rendered.len()
+            || !rendered.is_char_boundary(child_rendered_start)
+            || !rendered.is_char_boundary(child_rendered_end)
+        {
+            continue;
+        }
+        regions.push((child_rendered_start, child_rendered_end, child));
+    }
+
+    // 2. Order the splice by rendered start so the pass is monotonic over
+    //    disjoint regions regardless of attribute reordering (sorting).
+    regions.sort_by_key(|(start, _, _)| *start);
+
+    // 3. Single left-to-right pass: copy the verbatim rendered bytes between
+    //    child regions, and for each child region emit the child's own recursive
+    //    rewrite with geometry recomputed from the rendered position (Finding 4).
+    let mut out = String::with_capacity(rendered.len());
+    let mut cursor = 0usize;
+    for (start, end, child) in regions {
+        // Skip any child whose region would run backwards relative to the cursor
+        // (overlap / out-of-order); children are disjoint, so this is defensive.
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&rendered[cursor..start]);
+
+        // Recompute the child's geometry from the composed output buffer at the
+        // exact position its `<` will occupy (Finding 4). The child's `<` lands
+        // at `out.len()` right now (we have just copied the rendered bytes up to
+        // its region), so the display column is measured against the real output
+        // line it sits on — not its source column. We measure against `out.len()`
+        // rather than the `rendered` offset because earlier child rewrites may
+        // have changed `out`'s length relative to `rendered`.
+        //
+        // `base_indent_col` is set equal to the recomputed `open_col` so the
+        // child is laid out as the head of its own region rather than being
+        // classified mid-line and refused a wrap. This is a pure function of the
+        // deterministic enclosing render, so it reproduces identically on the
+        // idempotence pass (Requirement 8.5).
+        let child_open_offset = out.len();
+        let (child_open_col, _child_line_indent) =
+            column_geometry_at(&out, child_open_offset, indent_width);
+        let child_tag = ScannedTag {
+            open_col: child_open_col,
+            base_indent_col: child_open_col,
+            ..child.tag.clone()
+        };
+
+        // Recurse: the child's own per-tag self-check runs inside this call on
+        // the child's OWN sub-span only, so a diverging child reverts only its
+        // own bytes while the enclosing tag and siblings keep their rewrites
+        // (Requirement 7.6). The child's attribute `raw` slices (and its own
+        // descendants' spans) borrow the ORIGINAL source, so `child_src` must be
+        // the child's bytes as they appear in `rendered` (still verbatim here).
+        let child_src = &rendered[start..end];
+        let child_rewrite =
+            rewrite_tag(&child_tag, child_src, config, profile, newline, sorting, scheme);
+        out.push_str(&child_rewrite);
+        cursor = end;
+    }
+    // Trailing rendered bytes after the last child region. `cursor` is always a
+    // valid char boundary <= rendered.len() (it is a region end we bounds-checked
+    // or `0`), so this slice is total.
+    out.push_str(&rendered[cursor..]);
+    out
 }
 
 #[cfg(test)]
@@ -3883,6 +4034,7 @@ mod self_check_angle_bracket_corpus {
                 name: "Misread".to_string(),
                 self_closing: false,
                 attributes: vec![(Some("arg".to_string()), "arg".to_string())],
+                children: Vec::new(),
             };
             let symmetric_items = || {
                 vec![
@@ -4707,5 +4859,241 @@ mod child_container_property_tests {
             prop_assert!(crate::verify::angle_brackets_conserved(&bare, &out_bare));
             prop_assert!(crate::verify::angle_brackets_conserved(&wrapped, &out_wrapped));
         }
+    }
+}
+
+#[cfg(test)]
+mod attribute_value_preservation_baseline {
+    //! Post-Decision-0 preservation baseline (jsx-nested-container-start-tag-
+    //! not-wrapped spec, **task 1.3**): records the behavior of `F` — the plugin
+    //! WITH Design Decision 0 (the `</` regex guard of tasks 1.1/1.2) but WITHOUT
+    //! the children-tree fix of task 4 — for the `NOT isBugCondition` set, so
+    //! later tasks (3, 5, 6) can assert `F'(X) = F(X)` against the *correct*,
+    //! narrower invariant.
+    //!
+    //! ## Why this baseline is scoped the way it is
+    //!
+    //! Design Decision 0 deliberately CHANGES which tags are confident: an
+    //! enclosing tag with an element-bearing, `</…>`-carrying attribute value
+    //! (`<X primary={<a>…</a>} …/>`, `secondary={<span>…</span>}`) moves from a
+    //! `ComplexExpression` no-op (byte-for-byte unchanged on the pre-fix plugin)
+    //! to confidently rewritable. Those inputs are IN `isBugCondition` — they are
+    //! the bug being fixed — so they are **intentionally excluded** from the
+    //! `F(X) = F'(X)` byte-for-byte comparison and do NOT appear here.
+    //!
+    //! The inputs captured below all share one property: **no `</`-bearing
+    //! element inside an attribute value**. Concretely they cover generics and
+    //! `<`-operators, ordinary/call/arrow/ternary expressions, template literals,
+    //! regex literals, a `</` embedded in a string literal, pure spreads,
+    //! component-with-generics heads, child-position containers, and the other
+    //! dialects (HTML/Vue). Design Decision 0's guard only ever suppresses a
+    //! spurious regex read for a `/` IMMEDIATELY after a code-position `<`, so it
+    //! cannot alter the delimited span of any of these values — none of them
+    //! contains a code-position `</`. They are therefore byte-for-byte identical
+    //! to the pre-fix plugin, and this module pins exactly that narrower,
+    //! correct preservation invariant (bugfix.md 3.1, 3.2, 3.9, 3.10, 3.11;
+    //! design.md "Preservation-baseline consequence" / Finding 1).
+    //!
+    //! ## What the captured `F` outputs show (observed on post-Decision-0 code)
+    //!
+    //! - The ENCLOSING tag's own top-level attributes DO fluid-wrap when the tag
+    //!   overflows — that is unchanged, non-Decision-0 behavior (the enclosing
+    //!   tags here have no element-bearing value, so they were already confident
+    //!   before Decision 0).
+    //! - Every non-element attribute value — a generic (`map<T>`, `a < b`,
+    //!   `useState<Array<Task>>()`, `axios.get<Array<Url>>(u)`), a regex
+    //!   (`/a}b/`), a template literal, a call/arrow/ternary, a `</` inside a
+    //!   string (`"</not a tag>"`), and a pure spread (`{...props}`) — is
+    //!   preserved BYTE-FOR-BYTE; only whitespace BETWEEN top-level attributes
+    //!   changes, and no `<`/`>` is added or dropped.
+    //! - Component-with-generics heads (`<EditableList<…>`, `<Select<Array<…>>`)
+    //!   stay not-confidently-rewritable byte-for-byte no-ops; Decision 0 does not
+    //!   touch the generics-head path (the head `<` is outside any brace and
+    //!   never reaches `delimit_braced`).
+    //! - Child-position containers, HTML, and Vue are unchanged.
+    //!
+    //! These tests PASS on task-1 code and must CONTINUE to pass after the
+    //! task-4 children-tree fix (preservation). The observations are on the
+    //! crate-internal `format_once` single pass (host-testable, no `wasm`
+    //! feature required), matching the sibling baseline modules in this file and
+    //! in `src/scanner.rs`.
+
+    use super::format_once;
+    use crate::config::{Configuration, SchemeId};
+    use std::path::Path;
+
+    /// Tunable test configuration; all optional dialects enabled so every
+    /// extension resolves.
+    fn config(line_width: u32, fluid: bool, sorting: bool) -> Configuration {
+        Configuration {
+            line_width,
+            fluid_wrapping: fluid,
+            attribute_sorting: sorting,
+            attribute_order_scheme: SchemeId::Standard,
+            indent_width: 2,
+            use_tabs: false,
+            vue: true,
+            astro: true,
+            svelte: true,
+        }
+    }
+
+    /// Run a single `format_once` pass and return the candidate bytes as a
+    /// string. These `¬C` inputs never hit a hard error.
+    fn format(file: &str, src: &str, cfg: &Configuration) -> String {
+        let out = format_once(Path::new(file), src.as_bytes(), None, cfg)
+            .expect("baseline inputs format without an engine error");
+        String::from_utf8(out).expect("output is valid UTF-8")
+    }
+
+    /// Pin the observed post-Decision-0 `F` output for `src` to exactly
+    /// `expected`, AND assert the pass is a byte-for-byte fixed point
+    /// (idempotence baseline, Requirement 8).
+    fn assert_baseline(file: &str, src: &str, cfg: &Configuration, expected: &str) {
+        let first = format(file, src, cfg);
+        assert_eq!(
+            first, expected,
+            "post-Decision-0 F baseline drifted for {src:?}"
+        );
+        let second = format(file, &first, cfg);
+        assert_eq!(
+            second, first,
+            "idempotence baseline failed: second pass differs for {src:?}"
+        );
+    }
+
+    // ----- Generics / `<`-operators inside attribute values (bugfix 3.1) ----
+    //
+    // The enclosing tag wraps its OWN attributes, but each generic / `<`-operator
+    // attribute value is preserved byte-for-byte: no nested child is recorded for
+    // it and the generics guard is NOT reintroduced-as-broken inside an
+    // attribute-value container. Decision 0 cannot alter these spans (no
+    // code-position `</`).
+
+    #[test]
+    fn generic_arrow_attribute_value_preserved() {
+        let src = "<X onClick={() => arr.map<T>(x => x)} a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" />";
+        let expected =
+            "<X onClick={() => arr.map<T>(x => x)}\n  a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn less_than_operator_attribute_value_preserved() {
+        let src = "<X disabled={a < b} a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" f=\"6\" />";
+        let expected = "<X disabled={a < b} a=\"1\" b=\"2\" c=\"3\"\n  d=\"4\" e=\"5\" f=\"6\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn nested_generic_attribute_value_preserved() {
+        let src = "<X value={useState<Array<Task>>()} a=\"1\" b=\"2\" c=\"3\" d=\"4\" />";
+        let expected = "<X value={useState<Array<Task>>()} a=\"1\"\n  b=\"2\" c=\"3\" d=\"4\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn member_call_generic_attribute_value_preserved() {
+        let src = "<X cfg={axios.get<Array<Url>>(u)} a=\"1\" b=\"2\" c=\"3\" d=\"4\" />";
+        let expected = "<X cfg={axios.get<Array<Url>>(u)} a=\"1\"\n  b=\"2\" c=\"3\" d=\"4\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    // ----- Regex / template-literal / `</`-in-string (bugfix 3.9, 3.11) -----
+    //
+    // A genuine regex literal, a template literal, and a `</` that lives inside a
+    // STRING literal are each consumed by `delimit_braced`'s pre-existing
+    // string/regex scanners before the `</` guard's ordinary-byte arm runs, so
+    // the guard never fires for them and the value delimits byte-for-byte
+    // identically with and without Decision 0.
+
+    #[test]
+    fn regex_literal_attribute_value_preserved() {
+        let src = "<X test={re.test(/a}b/)} a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" />";
+        let expected = "<X test={re.test(/a}b/)} a=\"1\" b=\"2\"\n  c=\"3\" d=\"4\" e=\"5\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn template_literal_attribute_value_preserved() {
+        let src = "<X key={`${a.task}-${a.user}`} a=\"1\" b=\"2\" c=\"3\" d=\"4\" />";
+        let expected = "<X key={`${a.task}-${a.user}`} a=\"1\"\n  b=\"2\" c=\"3\" d=\"4\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn closing_sequence_inside_string_literal_preserved() {
+        // `</not a tag>` lives inside a string, so the `</` is NOT a code-position
+        // closing tag: the guard never sees it, no child is recorded, and the
+        // value is byte-for-byte preserved (bugfix.md 3.11).
+        let src = "<X title={\"</not a tag>\"} a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" />";
+        let expected = "<X title={\"</not a tag>\"} a=\"1\" b=\"2\"\n  c=\"3\" d=\"4\" e=\"5\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    // ----- Ordinary / spread attribute values (bugfix 3.2, 3.9) -------------
+
+    #[test]
+    fn ordinary_expression_attribute_values_preserved() {
+        let src = "<X primary={primary} index={index} onClick={onRun} spacing={1} />";
+        let expected = "<X primary={primary} index={index}\n  onClick={onRun} spacing={1} />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    #[test]
+    fn pure_spread_attribute_preserved() {
+        let src = "<X {...props} a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" f=\"6\" />";
+        let expected = "<X {...props} a=\"1\" b=\"2\" c=\"3\" d=\"4\"\n  e=\"5\" f=\"6\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    // ----- Component-with-generics heads (bugfix 3.4; design Preservation 5) -
+    //
+    // An in-attribute-region `<` on the element head makes the tag
+    // not-confidently-rewritable: a byte-for-byte no-op regardless of width.
+    // Decision 0 does not touch this path.
+
+    #[test]
+    fn component_with_generics_head_is_noop() {
+        let src = "<EditableList<SearchEngineDomain> a=\"1\" b=\"2\" c=\"3\" d=\"4\" e=\"5\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), src);
+    }
+
+    #[test]
+    fn component_with_nested_generics_head_is_noop() {
+        let src = "<Select<Array<number>> labelId=\"x\" value={x} onChange={on} className=\"w\" />";
+        assert_baseline("file.tsx", src, &config(40, true, false), src);
+    }
+
+    // ----- Child-position container (bugfix 3.3) ----------------------------
+    //
+    // Already-fixed child-position-container behavior is unaffected by Decision 0
+    // and by this spec's scanner changes: the in-container `<Button>` still
+    // fluid-wraps exactly as the jsx-in-child-containers fix established.
+
+    #[test]
+    fn child_position_container_behavior_unchanged() {
+        let src = "<ul>\n  {cond && (\n    <Button variant=\"ghost\" size=\"sm\" onClick={p.go} disabled={p.busy} aria-label=\"next\" />\n  )}\n</ul>\n";
+        let expected = "<ul>\n  {cond && (\n    <Button variant=\"ghost\" size=\"sm\"\n      onClick={p.go} disabled={p.busy}\n      aria-label=\"next\" />\n  )}\n</ul>\n";
+        assert_baseline("file.tsx", src, &config(40, true, false), expected);
+    }
+
+    // ----- Other dialects (bugfix 3.6) --------------------------------------
+    //
+    // HTML/Vue (and by the same code path Astro/Svelte) never record children
+    // and are unchanged by this JSX/TSX-only fix.
+
+    #[test]
+    fn html_tag_wraps_fluidly() {
+        let src = "<div class=\"container\" id=\"main\" data-role=\"banner\" role=\"group\">x</div>";
+        let expected = "<div class=\"container\"\n  id=\"main\" data-role=\"banner\"\n  role=\"group\">x</div>";
+        assert_baseline("file.html", src, &config(30, true, false), expected);
+    }
+
+    #[test]
+    fn vue_tag_wraps_fluidly() {
+        let src = "<MyComp class=\"container\" id=\"main\" data-role=\"banner\" role=\"group\" />";
+        let expected = "<MyComp class=\"container\"\n  id=\"main\" data-role=\"banner\"\n  role=\"group\" />";
+        assert_baseline("app.vue", src, &config(30, true, false), expected);
     }
 }

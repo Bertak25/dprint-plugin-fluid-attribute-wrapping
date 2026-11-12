@@ -153,10 +153,40 @@ pub fn render_start_tag(
     newline: Newline,
     src_tag: &str,
 ) -> String {
+    render_start_tag_with_offsets(tag, config, newline, src_tag).0
+}
+
+/// Render the replacement text for `tag`'s source span, additionally returning
+/// an **attribute-offset table** that records, for each of `tag`'s attributes
+/// (in the exact order they appear in `tag.attributes`), the byte offset within
+/// the returned string at which that attribute's
+/// [`raw`](crate::model::Attribute::raw) slice begins (Finding 3, task 4.4).
+///
+/// The renderer emits each `attr.raw` verbatim in a single left-to-right pass,
+/// so the offset recorded for entry `i` is exactly the start of
+/// `tag.attributes[i].raw` in the output. The table is indexed positionally in
+/// lockstep with `tag.attributes`, so a caller that holds the SAME (possibly
+/// sorted) `tag.attributes` vector can look up an attribute's rendered start by
+/// the attribute's **identity** — never by a substring search over the output,
+/// which could mis-locate an attribute whose `raw` recurs elsewhere.
+///
+/// On the byte-for-byte no-op paths (a not-confidently-rewritable tag, or
+/// wrapping-and-sorting-disabled) the returned string is `src_tag` verbatim and
+/// the offset table is empty: those paths never rewrite the tag, so no caller
+/// needs to re-locate an attribute within the output (and the child-splice
+/// recursion in [`crate::engine`] only runs for confidently-rewritable tags).
+#[must_use]
+pub fn render_start_tag_with_offsets(
+    tag: &ScannedTag,
+    config: &Configuration,
+    newline: Newline,
+    src_tag: &str,
+) -> (String, Vec<usize>) {
     // A tag the scanner could not delimit with full confidence is emitted
-    // byte-for-byte unchanged (Requirement 4.9): never wrap or reorder it.
+    // byte-for-byte unchanged (Requirement 4.9): never wrap or reorder it, and
+    // emit no offsets (the engine never splices children into a no-op tag).
     if !tag.confidently_rewritable {
-        return src_tag.to_string();
+        return (src_tag.to_string(), Vec::new());
     }
 
     if !config.fluid_wrapping {
@@ -167,13 +197,15 @@ pub fn render_start_tag(
 }
 
 /// Render with fluid wrapping enabled: compute the greedy layout and emit
-/// canonical whitespace.
-fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) -> String {
+/// canonical whitespace. Returns the rendered text plus the attribute-offset
+/// table (rendered start byte offset per attribute, in `tag.attributes` order).
+fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) -> (String, Vec<usize>) {
     let indent_width = usize::from(config.indent_width);
     let line_width = config.line_width as usize;
     let layout = plan_layout(tag, line_width, indent_width);
 
     let mut out = String::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(tag.attributes.len());
     out.push('<');
     out.push_str(tag.name);
 
@@ -181,10 +213,11 @@ fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) ->
         // One line: `<name` then each attribute preceded by a single space.
         for attr in &tag.attributes {
             out.push(' ');
+            offsets.push(out.len());
             out.push_str(attr.raw);
         }
         out.push_str(terminator(tag));
-        return out;
+        return (out, offsets);
     }
 
     // Multi-line: the first line holds the name prefix and the attributes of the
@@ -195,6 +228,7 @@ fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) ->
             // First line continues after `<name` with single-space separators.
             for attr in &tag.attributes[line.start..line.end] {
                 out.push(' ');
+                offsets.push(out.len());
                 out.push_str(attr.raw);
             }
         } else {
@@ -204,12 +238,13 @@ fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) ->
                 if offset > 0 {
                     out.push(' ');
                 }
+                offsets.push(out.len());
                 out.push_str(attr.raw);
             }
         }
     }
     out.push_str(terminator(tag));
-    out
+    (out, offsets)
 }
 
 /// Render with fluid wrapping disabled (Requirement 4.8).
@@ -220,11 +255,16 @@ fn render_wrapped(tag: &ScannedTag, config: &Configuration, newline: Newline) ->
 /// whitespace that separated them in the source, so the upstream line breaks are
 /// left unchanged. The terminator is still normalized to its canonical form so
 /// the self-closing space stays idempotent.
-fn render_wrapping_disabled(tag: &ScannedTag, config: &Configuration, src_tag: &str) -> String {
+fn render_wrapping_disabled(
+    tag: &ScannedTag,
+    config: &Configuration,
+    src_tag: &str,
+) -> (String, Vec<usize>) {
     // Both wrapping and sorting disabled: the tag is unchanged. Return it
-    // verbatim so the document is byte-for-byte preserved.
+    // verbatim so the document is byte-for-byte preserved. No offsets: this is a
+    // pure no-op, and the engine does not splice children into it.
     if !config.attribute_sorting {
-        return src_tag.to_string();
+        return (src_tag.to_string(), Vec::new());
     }
 
     // Sorting enabled, wrapping disabled (Requirements 4.8, 5): emit the
@@ -245,6 +285,7 @@ fn render_wrapping_disabled(tag: &ScannedTag, config: &Configuration, src_tag: &
     let had_leading_break = leading_breaks_by_attribute(src_tag, tag);
 
     let mut out = String::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(tag.attributes.len());
     out.push('<');
     out.push_str(tag.name);
     for (idx, attr) in tag.attributes.iter().enumerate() {
@@ -262,10 +303,11 @@ fn render_wrapping_disabled(tag: &ScannedTag, config: &Configuration, src_tag: &
             " "
         };
         out.push_str(sep);
+        offsets.push(out.len());
         out.push_str(attr.raw);
     }
     out.push_str(terminator(tag));
-    out
+    (out, offsets)
 }
 
 /// For each attribute of `tag` (in the tag's current, possibly sorted order),
@@ -352,6 +394,7 @@ mod tests {
             confidently_rewritable: true,
             open_col,
             base_indent_col,
+            children: Vec::new(),
         }
     }
 
@@ -1069,6 +1112,7 @@ mod continuation_indent_property_tests {
                         // char, so its column equals the line indentation.
                         open_col: col,
                         base_indent_col: col,
+                        children: Vec::new(),
                     }
                 },
             )
@@ -1380,6 +1424,7 @@ mod attribute_set_property_tests {
             confidently_rewritable: true,
             open_col,
             base_indent_col,
+            children: Vec::new(),
         }
     }
 
@@ -1632,6 +1677,7 @@ mod multibyte_boundary_exploration {
             confidently_rewritable: true,
             open_col: 0,
             base_indent_col: 0,
+            children: Vec::new(),
         }
     }
 
@@ -1779,6 +1825,7 @@ mod preservation_baseline {
             confidently_rewritable: true,
             open_col: 0,
             base_indent_col: 0,
+            children: Vec::new(),
         }
     }
 
@@ -1972,6 +2019,7 @@ mod classification_equivalence {
             confidently_rewritable: true,
             open_col: 0,
             base_indent_col: 0,
+            children: Vec::new(),
         }
     }
 
@@ -2282,6 +2330,7 @@ mod multibyte_boundary_property_tests {
             confidently_rewritable: true,
             open_col: 0,
             base_indent_col: 0,
+            children: Vec::new(),
         }
     }
 
