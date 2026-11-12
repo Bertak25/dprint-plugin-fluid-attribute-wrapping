@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+
+# Kiro local workspace state (tool-specific). The canonical specs live in
+# docs/specs/ and are committed. Keep the steering pointer so a fresh clone
+# still wires Kiro to the shared source of truth.
+#
+# NOTE: git cannot re-include a file if a PARENT directory is excluded, so we
+# ignore the *contents* of .kiro (/.kiro/*) rather than the directory itself,
+# then re-include the steering directory and its pointer file step by step.
+/.kiro/*
+!/.kiro/steering/
+/.kiro/steering/*
+!/.kiro/steering/specs.md

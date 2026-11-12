@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ffcb1d1a6151a4345254f57fe58c1a5095f842e83e519f43311edb505a7217c8 # shrinks to gen = [GenAttr { kind: NameValue, name: "class", tag: 0 }, GenAttr { kind: NameValue, name: "aria-label", tag: 1 }, GenAttr { kind: NameValue, name: "class", tag: 2 }, GenAttr { kind: Plain, name: "aria-label", tag: 3 }]

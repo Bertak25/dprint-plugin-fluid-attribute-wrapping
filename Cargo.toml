@@ -1,0 +1,23 @@
+[package]
+name = "dprint-plugin-fluid-attribute-wrapping"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A dprint plugin that applies fluid (greedy) wrapping and optional sorting to markup element attributes."
+repository = "https://github.com/Bertak25/dprint-plugin-fluid-attribute-wrapping"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Gates the Wasm plugin machinery so host-target builds/tests stay lean.
+wasm = ["dprint-core/wasm"]
+
+[dependencies]
+dprint-core = "0.71.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+proptest = "1.12.0"

@@ -1,0 +1,11 @@
+# Clippy configuration for the Fluid Attribute Wrapping Plugin.
+# The crate opts into pedantic lints at the crate root (see src/lib.rs).
+# This file carries tunables for specific lints so that thresholds are explicit
+# rather than relying on clippy defaults that may shift between toolchains.
+
+# Keep the cognitive-complexity bar strict; the scanner/wrap code must stay readable.
+cognitive-complexity-threshold = 25
+
+# Document the maximum number of lines a function may span before triggering
+# `clippy::too_many_lines`; raised modestly for the scanner state machine.
+too-many-lines-threshold = 120

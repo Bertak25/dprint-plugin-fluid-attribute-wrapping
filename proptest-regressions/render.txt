@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd40bf7909beea7bebc6b75adf93075f56e7f6cceba89f67a543c337ba8a5a1f # shrinks to tag = ScannedTag { span: 0..1, name: "a", self_closing: false, attributes: [Attribute { kind: Plain, name_key: None, raw: "a", width: 1 }, Attribute { kind: Plain, name_key: None, raw: "a", width: 1 }], confidently_rewritable: true, open_col: 0, base_indent_col: 1 }, indent_width = 1, use_tabs = false

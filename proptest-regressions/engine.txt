@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d1b4d5ef10633839c50e3f6387875a47c32a6797954303908fee24e588047296 # shrinks to ext = "html", src = "<a\n data-very-long-serialized-config=\"alpha-bravo-charlie-delta\"><A data-very-long-serialized-config=\"alpha-bravo-charlie-delta\" a>", config = Configuration { line_width: 1, fluid_wrapping: true, attribute_sorting: false, attribute_order_scheme: Standard, indent_width: 1, use_tabs: false, vue: true, astro: true, svelte: true }
+cc 47859c692942d9ab298ac37431eb82dbc2bff5f8955bb83c7b55554185a3e48a # shrinks to ext = "html", src = "<a data-very-long-serialized-config=\"alpha-bravo-charlie-delta\"\naa data-very-long-serialized-config=\"alpha-bravo-charlie-delta\">", config = Configuration { line_width: 1, fluid_wrapping: false, attribute_sorting: true, attribute_order_scheme: Standard, indent_width: 1, use_tabs: false, vue: true, astro: true, svelte: true }
+cc c85383d188f15bec1fd1fa420e27bf9797889bb115312b36129b644ccf5d1e6d # shrinks to ext = "html", src = "<A af=\"\"\na=\"\" f>", config = Configuration { line_width: 1, fluid_wrapping: false, attribute_sorting: true, attribute_order_scheme: Standard, indent_width: 1, use_tabs: false, vue: true, astro: true, svelte: true }

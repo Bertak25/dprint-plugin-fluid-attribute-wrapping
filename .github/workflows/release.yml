@@ -1,0 +1,81 @@
+name: Release
+
+# Triggered when a version tag is pushed (e.g. `git push origin v0.1.0`).
+# The tag points at a commit — normally your latest `master` commit — and the
+# job builds that commit, so tagging master is exactly how a release is cut.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  # Required for the job to create a GitHub Release and upload assets.
+  contents: write
+
+jobs:
+  release:
+    name: Build Wasm and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+
+      - name: Install the pinned Rust toolchain
+        # rust-toolchain.toml pins the channel; this action reads it and adds
+        # the wasm32-unknown-unknown target the build needs.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Verify the tag matches the crate version
+        # Guard against a mismatched tag: v0.1.0 must correspond to
+        # version = "0.1.0" in Cargo.toml, since plugin_info() reports the
+        # Cargo version to dprint at runtime.
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $tag_version) does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+          echo "tag and crate version agree: $crate_version"
+
+      - name: Run the quality gate
+        # A release must be green: tests plus pedantic clippy in both configs.
+        run: |
+          cargo test --features wasm
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features wasm -- -D warnings
+
+      - name: Build and verify the Wasm module
+        run: bash scripts/build-wasm.sh
+
+      - name: Compute the artifact checksum
+        # dprint lets users pin a plugin by URL@checksum; publish the sha256 so
+        # they can. The checksum is written into the release notes below.
+        id: checksum
+        run: |
+          wasm="target/wasm32-unknown-unknown/release/dprint_plugin_fluid_attribute_wrapping.wasm"
+          sum="$(sha256sum "$wasm" | cut -d' ' -f1)"
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "sha256: $sum"
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          # Attach the built module as a release asset. Its stable download URL
+          # is:
+          #   https://github.com/<owner>/<repo>/releases/download/<tag>/dprint_plugin_fluid_attribute_wrapping.wasm
+          files: target/wasm32-unknown-unknown/release/dprint_plugin_fluid_attribute_wrapping.wasm
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Add to your `dprint.json` plugins array:
+
+            ```json
+            "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/dprint_plugin_fluid_attribute_wrapping.wasm@${{ steps.checksum.outputs.sha256 }}"
+            ```
+
+            **SHA-256:** `${{ steps.checksum.outputs.sha256 }}`

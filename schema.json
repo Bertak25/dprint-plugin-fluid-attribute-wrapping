@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Bertak25/dprint-plugin-fluid-attribute-wrapping/master/schema.json",
+  "title": "Fluid Attribute Wrapping Plugin Configuration",
+  "description": "Configuration for the dprint fluid attribute wrapping plugin.",
+  "type": "object",
+  "properties": {
+    "lineWidth": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 80,
+      "description": "Maximum line width in columns. Defaults to the dprint global line width when unset."
+    },
+    "fluidWrapping": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether fluid (greedy) attribute wrapping is enabled."
+    },
+    "attributeSorting": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether attribute sorting is enabled."
+    },
+    "attributeOrderScheme": {
+      "type": "string",
+      "enum": ["standard"],
+      "default": "standard",
+      "description": "The attribute order scheme applied when sorting is enabled."
+    },
+    "vue": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the Vue dialect (.vue files) is enabled."
+    },
+    "astro": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the Astro dialect (.astro files) is enabled."
+    },
+    "svelte": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the Svelte dialect (.svelte files) is enabled."
+    }
+  },
+  "additionalProperties": false
+}
